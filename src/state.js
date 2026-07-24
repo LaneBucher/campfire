@@ -16,6 +16,7 @@ export const fire = {
   sound: false,
   paused: false,
   dragging: false,     // suppresses hover cursors while a log is in hand
+  litLogs: 0,          // sum of per-log burn strength — drives how big the fire gets
 
   /** Rough heat field: 1 at the heart of the flame, 0 well away from it. */
   heatAt(p) {
@@ -28,6 +29,12 @@ export const fire = {
     return radial * (0.35 + 0.65 * vertical) * (0.25 + 0.9 * this.intensity)
   },
 }
+
+/* Live burning logs, keyed by log id. The flame shader turns these into the
+   fuel field it burns from, so flames sit on the actual wood instead of on a
+   fixed column at the origin. Each entry: { a, b, r, lit } in world space,
+   where a/b are the log's end caps. */
+export const fireLogs = new Map()
 
 export const WORLD = {
   pitRadius: 0.78,

@@ -3,7 +3,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
 import { Stars, OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { fire, WORLD } from './state'
+import { fire, fireLogs, WORLD } from './state'
 import Fire from './Fire'
 import { barkTextures, groundTextures, stoneTextures, logGeometry, stoneGeometry } from './procedural'
 import { crackle, hiss } from './audio'
@@ -15,7 +15,18 @@ function FireSim() {
     const dt = Math.min(dtRaw, 0.05)
     // fuel burns down on its own; logs in the flame top it back up (see Log)
     fire.fuel = THREE.MathUtils.clamp(fire.fuel - dt * 0.022 * (0.4 + fire.intensity), 0, 1)
-    const target = Math.pow(fire.fuel, 0.75)
+
+    let alight = 0
+    for (const l of fireLogs.values()) alight += l.lit
+    fire.litLogs = alight
+
+    // Wood on the fire is what makes it big. With an empty pit even a full fuel
+    // bar only keeps a low flicker going over the embers.
+    const target = THREE.MathUtils.clamp(
+      0.10 + 0.28 * Math.pow(fire.fuel, 0.75) + 0.64 * Math.min(1, alight / 2.2),
+      0,
+      1
+    )
     fire.intensity += (target - fire.intensity) * (1 - Math.pow(0.25, dt))
     fire.gust *= Math.pow(0.12, dt)
     // ambient breeze wanders instead of blowing dead straight
@@ -251,6 +262,16 @@ function Log({ log, onBurnt, onGrab, dragState }) {
   )
   const geom = useMemo(() => logGeometry(log.len, log.rad, log.seed), [log])
   const tmp = useMemo(() => new THREE.Vector3(), [])
+  const lit = useRef(0)
+  const seg = useMemo(
+    () => ({ a: new THREE.Vector3(), b: new THREE.Vector3(), r: log.rad, lit: 0 }),
+    [log.rad]
+  )
+  const axis = useMemo(() => new THREE.Vector3(), [])
+  const quat = useMemo(() => new THREE.Quaternion(), [])
+
+  // stop feeding the flame as soon as this log is gone
+  useEffect(() => () => fireLogs.delete(log.id), [log.id])
 
   useFrame((s, dtRaw) => {
     const b = body.current
@@ -259,6 +280,26 @@ function Log({ log, onBurnt, onGrab, dragState }) {
     const t = b.translation()
     tmp.set(t.x, t.y, t.z)
     const heat = fire.heatAt(tmp)
+
+    // How well alight this log is. It takes a couple of seconds to catch and a
+    // few more to go out, so a log pulled from the fire keeps burning a while.
+    const wants = heat > 0.14 ? Math.min(1, heat * 1.7) : 0
+    const rate = wants > lit.current ? 0.55 : 0.28
+    lit.current += (wants - lit.current) * (1 - Math.exp(-rate * dt * 3))
+    if (lit.current > 0.004) {
+      const q = b.rotation()
+      quat.set(q.x, q.y, q.z, q.w)
+      // the log mesh lies along its local X axis
+      axis.set(1, 0, 0).applyQuaternion(quat).multiplyScalar(log.len * 0.5 * (1 - burn.current * 0.42))
+      seg.a.copy(tmp).sub(axis)
+      seg.b.copy(tmp).add(axis)
+      seg.r = log.rad * (1 - burn.current * 0.42)
+      seg.lit = lit.current
+      fireLogs.set(log.id, seg)
+    } else if (fireLogs.has(log.id)) {
+      fireLogs.delete(log.id)
+    }
+
     if (heat > 0.12) {
       const rate = dt * heat * 0.055
       burn.current = Math.min(1, burn.current + rate)
@@ -268,11 +309,13 @@ function Log({ log, onBurnt, onGrab, dragState }) {
     }
     const bn = burn.current
     if (bn > 0) {
-      // chars to black first; the coal glow only shows up once it is well alight
+      // Wood in a fire blackens within seconds — char fast, so a log sitting in
+      // the flames reads as a dark shape behind them rather than a pale blob.
+      const ch = Math.min(1, bn * 3.2)
       material.color.setRGB(
-        0.44 * (1 - bn * 0.93),
-        0.35 * (1 - bn * 0.95),
-        0.27 * (1 - bn * 0.96)
+        0.40 * (1 - ch * 0.94),
+        0.32 * (1 - ch * 0.95),
+        0.25 * (1 - ch * 0.96)
       )
       const g0 = Math.max(0, bn - 0.3) / 0.7
       const glow = Math.pow(g0, 1.7) * 0.42 * (0.65 + 0.35 * Math.sin(s.clock.elapsedTime * 2.6 + log.id))

@@ -1,7 +1,7 @@
-import { useMemo, useRef } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useEffect, useMemo, useRef } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
 import * as THREE from 'three'
-import { fire, WORLD } from './state'
+import { fire, fireLogs, WORLD } from './state'
 import { smokeTexture, sparkTexture } from './procedural'
 
 /* ============================ shared GLSL noise ============================ */
@@ -44,7 +44,15 @@ void main(){
 
 const flameFrag = /* glsl */ `
 precision highp float;
-uniform float uTime, uIntensity, uHeight, uRadius, uWindX, uWindZ, uBright, uFlicker;
+uniform float uTime, uIntensity, uWindX, uWindZ, uBright, uFlicker;
+uniform float uDecay, uCoal, uCoalR, uThick;
+uniform vec4 uLogA[MAXLOGS];   // xyz = one end cap (box-local), w = log radius
+uniform vec4 uLogB[MAXLOGS];   // xyz = other end cap, w = how alight it is
+uniform int uLogCount;
+uniform sampler2D uDepth;
+uniform vec2 uRes;
+uniform float uNear, uFar;
+uniform mat4 uViewModel;
 varying vec3 vOrigin;
 varying vec3 vDir;
 ${NOISE}
@@ -59,48 +67,76 @@ vec2 hitBox(vec3 orig, vec3 dir){
   return vec2(max(tmin.x, max(tmin.y, tmin.z)), min(tmax.x, min(tmax.y, tmax.z)));
 }
 
-float density(vec3 p, out float hh){
-  float h = p.y + 0.5;
-  hh = h / max(uHeight, 0.001);
-  if (hh > 1.0 || h < 0.0) return 0.0;
-  // wind shears the column over, more so the higher you go
-  vec2 shear = vec2(uWindX, uWindZ) * pow(hh, 1.7);
+/* How much burnable gas is at this point. Every lit log emits a sheath that
+   hugs its surface and a plume that climbs off it, so the flames sit on the
+   wood and lick along it. The ember bed adds a low source of its own, which is
+   all that is left once the wood is gone. */
+float fuelAt(vec3 p, out float src){
+  float h = max(p.y + 0.5, 0.0);
+  vec2 shear = vec2(uWindX, uWindZ) * pow(h, 1.7);
   vec2 xz = p.xz - shear;
-  float r = length(xz);
-  // widest right over the fuel bed, tapering all the way to the tip
-  float prof = pow(max(0.0, 1.0 - hh), 0.55);
-  // a slowly turning lobe pattern so the fire burns in a few places at once
-  // instead of as one perfectly round column
-  float az = fbm(vec3(xz * 6.0, uTime * 0.5));
-  prof *= 0.68 + 0.70 * az;
-  float radius = uRadius * prof;
-  if (r > radius * 2.8) return 0.0;
+  float f = 0.0;
+  float top = 0.0;
+
+  float Rc = uCoalR * (1.0 + h * 1.3);
+  f += uCoal * (1.0 - smoothstep(Rc * 0.25, Rc, length(xz))) * exp(-h * (uDecay + 2.4));
+
+  for (int i = 0; i < MAXLOGS; i++){
+    if (i >= uLogCount) break;
+    float lit = uLogB[i].w;
+    vec3 a = uLogA[i].xyz;
+    vec3 b = uLogB[i].xyz;
+    float rad = uLogA[i].w;
+    // nearest point on the log's axis, measured in plan view
+    vec2 ab = b.xz - a.xz;
+    float t = clamp(dot(xz - a.xz, ab) / max(dot(ab, ab), 1e-5), 0.0, 1.0);
+    float dy = p.y - mix(a.y, b.y, t);
+    // flames wrap the sides and climb, but nothing burns underneath a log
+    if (dy < -rad * 1.3) continue;
+    float up = max(dy, 0.0);
+    float dh = length(xz - (a.xz + ab * t));
+    // a sheath hugging the bark, opening out into a plume as it climbs
+    float R = rad * 2.4 + up * 0.85;
+    float g = lit * (1.0 - smoothstep(R * 0.3, R, dh)) * exp(-up * uDecay);
+    f += g;
+    top = max(top, g);
+  }
+  src = top;
+  // Overlapping logs should feed each other, not stack into a solid block, so
+  // saturate the sum instead of letting it run away.
+  return 1.35 * (1.0 - exp(-f));
+}
+
+float density(vec3 p, out float hot){
+  hot = 0.0;
+  float src;
+  float f = fuelAt(p, src);
+  if (f < 0.02) return 0.0;
   // noise stretched vertically and advected upward -> licking tongues, not blobs
-  vec3 q = vec3(xz * 3.6, p.y * 1.2 - uTime * 1.85);
+  vec3 q = vec3(p.xz * 4.0, p.y * 1.6 - uTime * 1.95);
   float n1 = fbm(q);
-  float n2 = fbm(q * 2.6 + vec3(19.0, 7.0, -uTime * 1.1));
+  float n2 = fbm(q * 2.6 + vec3(19.0, 7.0, -uTime * 1.15));
   // value-noise fbm clusters around 0.5 — stretch it out or the flame comes
   // out as one smooth teardrop instead of separate tongues
   float turb = smoothstep(0.30, 0.72, n1 * 0.6 + n2 * 0.4);
-  // clamp at zero first: outside the radius this term is negative, and the
-  // erosion factor below can be too, which would multiply back into flame
-  float base = max(0.0, 1.0 - r / max(radius, 1e-4));
-  // Down in the fuel bed there is always combustion, so keep a noise-independent
-  // floor that dies off with height. Above it the turbulence alone decides, and
-  // being able to go negative is what breaks the plume into separate tongues.
-  float alight = 0.55 * exp(-hh * 4.5);
-  float d = base * (1.95 * turb - 0.52 + alight) - hh * hh * 0.85;
-  d *= uFlicker;
-  return smoothstep(0.0, 0.22, d);
+  // the noise has to be able to drive this negative, otherwise the plume never
+  // breaks into separate tongues
+  float d = f * (0.40 + 1.70 * turb) * uFlicker - 0.60;
+  // a wide ramp on purpose: if d saturates at 1 through the whole interior the
+  // flame renders as one flat slab of a single colour
+  d = smoothstep(0.0, 0.62, d);
+  // hottest right against the fuel, cooling as it rises away
+  hot = d * (0.38 + 0.72 * min(f, 1.6)) * (1.0 - clamp((p.y + 0.5) * 0.40, 0.0, 0.58));
+  return d;
 }
 
 vec3 fireColor(float t){
   t = clamp(t, 0.0, 1.0);
-  vec3 c = mix(vec3(0.30, 0.010, 0.0005), vec3(0.95, 0.075, 0.003), smoothstep(0.0, 0.30, t));
-  c = mix(c, vec3(1.0, 0.26, 0.015), smoothstep(0.26, 0.58, t));
-  c = mix(c, vec3(1.0, 0.40, 0.04), smoothstep(0.55, 0.82, t));
+  vec3 c = mix(vec3(0.30, 0.010, 0.0005), vec3(0.95, 0.09, 0.004), smoothstep(0.0, 0.30, t));
+  c = mix(c, vec3(1.0, 0.32, 0.022), smoothstep(0.26, 0.58, t));
+  c = mix(c, vec3(1.0, 0.52, 0.07), smoothstep(0.55, 0.82, t));
   // never ramp to white here — let ACES desaturate the hottest cores instead
-  c = mix(c, vec3(1.0, 0.54, 0.10), smoothstep(0.82, 1.0, t));
+  c = mix(c, vec3(1.0, 0.74, 0.26), smoothstep(0.82, 1.0, t));
   return c;
 }
 
@@ -109,29 +145,44 @@ void main(){
   vec2 b = hitBox(vOrigin, rd);
   if (b.x > b.y) discard;
   b.x = max(b.x, 0.0);
+
+  // View-space depth of the nearest solid surface on this pixel. Without it the
+  // volume draws straight over the stones and logs standing in front of it.
+  float dz = texture2D(uDepth, gl_FragCoord.xy / uRes).x;
+  float sceneVZ = (uNear * uFar) / ((uFar - uNear) * dz - uFar);
+
   float dt = (b.y - b.x) / float(STEPS);
   // interleaved gradient noise: dithers away the step banding without the
   // salt-and-pepper a pure random offset leaves behind
   float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
   vec3 p = vOrigin + rd * (b.x + dt * jit);
+  float vz = (uViewModel * vec4(p, 1.0)).z;
+  float vzStep = (uViewModel * vec4(rd * dt, 0.0)).z;
+
   vec3 acc = vec3(0.0);
   float tau = 0.0;                       // optical depth so far
   for (int i = 0; i < STEPS; i++){
-    float hh;
-    float d = density(p, hh) * uIntensity;
+    float gap = vz - sceneVZ;            // >0 while the sample is still in front
+    if (gap < 0.0) break;
+    float hot;
+    float d = density(p, hot) * uIntensity;
     if (d > 0.002){
-      // hottest down in the fuel bed, cooling to red at the tips
-      float temp = d * (0.78 - hh * 0.34);
-      float em = d * dt * uBright * (0.55 + 0.75 * (1.0 - hh)) * 6.0;
+      // soften the last few centimetres so the flame meets wood and stone
+      // without a hard cut-out edge
+      float soft = smoothstep(0.0, 0.03, gap);
+      float em = d * dt * uBright * 6.0 * soft;
       // flame is optically thick: the near side hides the far side, which is
-      // what stops the core turning into one flat white disc
-      acc += fireColor(temp) * em * exp(-tau);
-      tau += d * dt * 6.5;
-      if (tau > 5.0) break;
+      // what stops the core turning into one flat washed-out disc
+      acc += fireColor(hot) * em * exp(-tau);
+      tau += d * dt * uThick * soft;
+      if (tau > 6.0) break;
     }
     p += rd * dt;
+    vz += vzStep;
   }
-  gl_FragColor = vec4(acc, 1.0);
+  // premultiplied alpha: a dense flame hides what is behind it instead of
+  // glowing straight through it
+  gl_FragColor = vec4(acc, 1.0 - exp(-tau));
 }
 `
 
@@ -139,36 +190,101 @@ void main(){
 const BOX = [2.0, 1.9, 2.0]
 const BASE_Y = 0.02
 
+const MAX_LOGS = 6
+const CENTER_Y = BASE_Y + BOX[1] / 2
+
 function Flame({ quality }) {
   const mesh = useRef()
   const inv = useMemo(() => new THREE.Matrix4(), [])
+  const { gl, scene, camera, size } = useThree()
+
+  // Depth of the opaque scene, so the raymarch can stop at stones and logs.
+  const depthRT = useMemo(() => {
+    const depthTexture = new THREE.DepthTexture(1, 1)
+    depthTexture.type = THREE.UnsignedIntType
+    depthTexture.minFilter = THREE.NearestFilter
+    depthTexture.magFilter = THREE.NearestFilter
+    return new THREE.WebGLRenderTarget(1, 1, {
+      depthTexture,
+      depthBuffer: true,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+    })
+  }, [])
+  useEffect(() => () => depthRT.dispose(), [depthRT])
 
   const material = useMemo(() => {
-    const steps = [28, 48, 72][quality]
+    const steps = [36, 56, 80][quality]
     const oct = [3, 4, 4][quality]
     return new THREE.ShaderMaterial({
       vertexShader: flameVert,
-      fragmentShader: `#define STEPS ${steps}\n#define OCTAVES ${oct}\n` + flameFrag,
+      fragmentShader:
+        `#define STEPS ${steps}\n#define OCTAVES ${oct}\n#define MAXLOGS ${MAX_LOGS}\n` + flameFrag,
       uniforms: {
         uTime: { value: 0 },
         uIntensity: { value: 1 },
-        uHeight: { value: 0.8 },
-        uRadius: { value: 0.3 },
         uWindX: { value: 0 },
         uWindZ: { value: 0 },
         uBright: { value: 0.9 },
         uFlicker: { value: 1 },
+        uDecay: { value: 3.2 },
+        uCoal: { value: 0.5 },
+        uCoalR: { value: 0.3 },
+        uThick: { value: 9 },
+        uLogA: { value: Array.from({ length: MAX_LOGS }, () => new THREE.Vector4()) },
+        uLogB: { value: Array.from({ length: MAX_LOGS }, () => new THREE.Vector4()) },
+        uLogCount: { value: 0 },
         uInvModel: { value: new THREE.Matrix4() },
+        uViewModel: { value: new THREE.Matrix4() },
+        uDepth: { value: null },
+        uRes: { value: new THREE.Vector2(1, 1) },
+        uNear: { value: 0.05 },
+        uFar: { value: 200 },
       },
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      // depth is handled per sample against uDepth, not by the box's own faces
+      depthTest: false,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneMinusSrcAlphaFactor,
+      blendEquation: THREE.AddEquation,
       side: THREE.FrontSide,
       toneMapped: false,
     })
   }, [quality])
 
-  useFrame((s, dt) => {
+  // scratch, reused every frame
+  const scratch = useMemo(
+    () => ({ a: new THREE.Vector3(), b: new THREE.Vector3(), list: [] }),
+    []
+  )
+
+  useFrame((s) => {
+    const m = mesh.current
+    if (!m) return
+    const dpr = gl.getPixelRatio()
+    const w = Math.max(1, Math.floor(size.width * dpr))
+    const h = Math.max(1, Math.floor(size.height * dpr))
+    if (depthRT.width !== w || depthRT.height !== h) depthRT.setSize(w, h)
+    // hide the volume for the prepass, or it pays for itself twice
+    m.visible = false
+    const prev = gl.getRenderTarget()
+    const prevShadow = gl.shadowMap.autoUpdate
+    gl.shadowMap.autoUpdate = false // the real pass already refreshed them
+    gl.setRenderTarget(depthRT)
+    gl.render(scene, camera)
+    gl.setRenderTarget(prev)
+    gl.shadowMap.autoUpdate = prevShadow
+    m.visible = true
+    const u = material.uniforms
+    u.uDepth.value = depthRT.depthTexture
+    u.uRes.value.set(w, h)
+    u.uNear.value = camera.near
+    u.uFar.value = camera.far
+  }, -2)
+
+  useFrame((s) => {
     const u = material.uniforms
     const t = s.clock.elapsedTime
     if (!fire.paused) u.uTime.value = t
@@ -182,28 +298,67 @@ function Flame({ quality }) {
       0.035 * Math.sin(t * 7.3 + 1.3) +
       0.025 * Math.sin(t * 17.7 + 0.6)
     u.uFlicker.value = fl + fire.gust * 0.35
-    u.uIntensity.value = 0.45 + I * 1.25 + fire.gust * 0.6
-    u.uHeight.value = THREE.MathUtils.clamp(0.26 + I * 0.40 + fire.gust * 0.10, 0.1, 1.0)
-    u.uRadius.value = 0.185 + I * 0.075
-    u.uBright.value = 0.16 + I * 0.075
+    u.uIntensity.value = 0.75 + I * 0.45 + fire.gust * 0.35
+    u.uBright.value = 0.30 + I * 0.12
+    u.uThick.value = 9 + I * 4
+    // plumes climb higher the harder it is burning
+    u.uDecay.value = 8.8 - I * 2.6 - fire.gust * 0.7
+    // with no wood left this is the whole fire: a low flicker over the embers
+    u.uCoal.value = 0.44 + 0.48 * fire.fuel
+    u.uCoalR.value = 0.24 + 0.06 * I
     // shear is in local box units — anything much past 0.4 tips the flame
     // straight out through the side of its own volume
     const gustPush = fire.gust * 0.35
     u.uWindX.value = fire.wind.x * 0.45 + gustPush * Math.cos(fire.windAngle)
     u.uWindZ.value = fire.wind.y * 0.45 + gustPush * Math.sin(fire.windAngle)
-    if (mesh.current) {
-      inv.copy(mesh.current.matrixWorld).invert()
-      u.uInvModel.value.copy(inv)
-      // front faces vanish once the camera is inside the box — flip to back faces
-      const c = s.camera.position
-      const inside =
-        Math.abs(c.x) < BOX[0] / 2 &&
-        Math.abs(c.z) < BOX[2] / 2 &&
-        c.y > BASE_Y &&
-        c.y < BASE_Y + BOX[1]
-      const want = inside ? THREE.BackSide : THREE.FrontSide
-      if (material.side !== want) material.side = want
+
+    // hand the shader the logs that are actually alight, brightest first
+    const list = scratch.list
+    list.length = 0
+    for (const l of fireLogs.values()) list.push(l)
+    if (list.length > MAX_LOGS) {
+      list.sort((x, y) => y.lit - x.lit)
+      list.length = MAX_LOGS
     }
+    for (let i = 0; i < list.length; i++) {
+      const l = list[i]
+      // A log carried out of the pit keeps burning for a moment; fade its flame
+      // before it reaches the wall of the volume so it never clips flat.
+      const edge = Math.max(
+        Math.abs((l.a.x + l.b.x) * 0.5) / (BOX[0] * 0.5),
+        Math.abs((l.a.z + l.b.z) * 0.5) / (BOX[2] * 0.5)
+      )
+      const fade = 1 - THREE.MathUtils.smoothstep(edge, 0.5, 0.88)
+      // world -> box-local: the volume is axis aligned, so this is just a scale
+      u.uLogA.value[i].set(
+        l.a.x / BOX[0],
+        (l.a.y - CENTER_Y) / BOX[1],
+        l.a.z / BOX[2],
+        Math.max(l.r / BOX[0], 0.01)
+      )
+      u.uLogB.value[i].set(
+        l.b.x / BOX[0],
+        (l.b.y - CENTER_Y) / BOX[1],
+        l.b.z / BOX[2],
+        l.lit * fade
+      )
+    }
+    u.uLogCount.value = list.length
+
+    const m = mesh.current
+    if (!m) return
+    inv.copy(m.matrixWorld).invert()
+    u.uInvModel.value.copy(inv)
+    u.uViewModel.value.copy(s.camera.matrixWorldInverse).multiply(m.matrixWorld)
+    // front faces vanish once the camera is inside the box — flip to back faces
+    const c = s.camera.position
+    const inside =
+      Math.abs(c.x) < BOX[0] / 2 &&
+      Math.abs(c.z) < BOX[2] / 2 &&
+      c.y > BASE_Y &&
+      c.y < BASE_Y + BOX[1]
+    const want = inside ? THREE.BackSide : THREE.FrontSide
+    if (material.side !== want) material.side = want
   })
 
   return (
@@ -412,7 +567,17 @@ function Embers() {
     material.uniforms.uScale.value = s.size.height * 0.9
   })
 
-  return <points ref={points} geometry={geom} material={material} frustumCulled={false} raycast={() => null} />
+  // after the flame (renderOrder 5), which is now opaque enough to hide them
+  return (
+    <points
+      ref={points}
+      geometry={geom}
+      material={material}
+      frustumCulled={false}
+      renderOrder={6}
+      raycast={() => null}
+    />
+  )
 }
 
 /* =================================== smoke ================================= */
@@ -503,8 +668,8 @@ function Smoke() {
       const a = Math.random() * Math.PI * 2
       const r = Math.random() * 0.2
       pos[i * 3] = Math.cos(a) * r
-      // born at the flame tip — below that the gas is still burning, not smoking
-      pos[i * 3 + 1] = 0.75 + fire.intensity * 0.75 + Math.random() * 0.35
+      // born above the flame tip — below that the gas is still burning, not smoking
+      pos[i * 3 + 1] = 0.95 + fire.intensity * 0.85 + Math.random() * 0.4
       pos[i * 3 + 2] = Math.sin(a) * r
       vel[i * 3] = (Math.random() - 0.5) * 0.25
       vel[i * 3 + 1] = 0.9 + Math.random() * 0.8 + fire.intensity * 0.7
@@ -541,7 +706,7 @@ function Smoke() {
       attr[i4 + 1] += spin[i] * dt
       const fadeIn = THREE.MathUtils.smoothstep(age, 0.0, 0.14)
       const fadeOut = 1 - THREE.MathUtils.smoothstep(age, 0.35, 1.0)
-      attr[i4 + 2] = fadeIn * fadeOut * (0.07 + fire.intensity * 0.09)
+      attr[i4 + 2] = fadeIn * fadeOut * (0.05 + fire.intensity * 0.07)
     }
     geom.attributes.iPos.needsUpdate = true
     geom.attributes.iAttr.needsUpdate = true
@@ -567,7 +732,9 @@ function FireLight() {
       0.05 * Math.sin(t * 3.1 + 4.2)
     const power = (0.35 + I * 1.5 + fire.gust * 1.2) * flicker
     if (main.current) {
-      main.current.intensity = THREE.MathUtils.lerp(main.current.intensity, power * 2.6, 1 - Math.pow(0.001, dt))
+      // keep this modest: wood sitting 30cm from the light blows straight out,
+      // and logs inside the fire should read as dark shapes behind the flame
+      main.current.intensity = THREE.MathUtils.lerp(main.current.intensity, power * 1.15, 1 - Math.pow(0.001, dt))
       main.current.position.set(
         Math.sin(t * 4.3) * 0.06,
         0.55 + I * 0.35 + Math.sin(t * 5.7) * 0.05,
@@ -582,14 +749,16 @@ function FireLight() {
       <pointLight
         ref={main}
         castShadow
-        distance={22}
-        decay={2}
+        distance={26}
+        // a fire is a volume, not a point: inverse-square makes anything sitting
+        // in the pit blow out long before the clearing is lit at all
+        decay={1.5}
         intensity={6}
         shadow-mapSize={[1024, 1024]}
         shadow-bias={-0.0015}
         shadow-normalBias={0.02}
       />
-      <pointLight ref={fill} position={[0, 1.6, 0]} distance={9} decay={2} color="#ff7a2a" intensity={2} />
+      <pointLight ref={fill} position={[0, 1.6, 0]} distance={12} decay={1.5} color="#ff7a2a" intensity={2} />
     </>
   )
 }
