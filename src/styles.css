@@ -1,0 +1,226 @@
+:root {
+  --warm: #ffb066;
+  --warm-dim: #c97a3c;
+  --panel: rgba(14, 12, 11, 0.62);
+  --edge: rgba(255, 176, 102, 0.18);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: #05070d;
+  overflow: hidden;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #efe4d8;
+  -webkit-font-smoothing: antialiased;
+  touch-action: none;
+}
+
+.app { position: fixed; inset: 0; }
+canvas { display: block; outline: none; }
+
+/* ---------------------------------- hud ---------------------------------- */
+.hud {
+  position: absolute;
+  z-index: 2;
+  backdrop-filter: blur(9px) saturate(1.15);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  user-select: none;
+}
+
+.hud.top {
+  top: 18px; left: 18px;
+  padding: 12px 18px;
+}
+.hud.top h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 620;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  background: linear-gradient(180deg, #fff3e0, var(--warm) 55%, #e0722a);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: 0 0 26px rgba(255, 150, 60, 0.28);
+}
+.hud.top p { margin: 4px 0 0; font-size: 11.5px; opacity: 0.55; letter-spacing: 0.04em; }
+
+/* fuel gauge */
+.hud.fuel {
+  top: 18px; right: 18px;
+  width: 190px;
+  display: grid;
+  gap: 6px;
+}
+.hud.fuel .label { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; opacity: 0.7; }
+.hud.fuel .sub { font-size: 10.5px; opacity: 0.42; }
+.bar {
+  height: 8px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+.bar i {
+  display: block;
+  height: 100%;
+  width: 60%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, #7a2d09, #ff7a1e 55%, #ffd48a);
+  box-shadow: 0 0 14px rgba(255, 130, 40, 0.75);
+  transition: width 0.14s linear;
+}
+
+/* action bar */
+.hud.controls {
+  bottom: 18px; left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  padding: 9px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: calc(100vw - 36px);
+}
+.hud button {
+  font: inherit;
+  font-size: 13px;
+  color: #f0e6da;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  padding: 9px 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.08s;
+  white-space: nowrap;
+}
+.hud button:hover { background: rgba(255, 150, 60, 0.16); border-color: rgba(255, 160, 80, 0.4); }
+.hud button:active { transform: translateY(1px) scale(0.985); }
+.hud button.on {
+  background: rgba(255, 132, 40, 0.24);
+  border-color: rgba(255, 160, 80, 0.55);
+  box-shadow: 0 0 18px rgba(255, 130, 40, 0.25);
+}
+
+/* settings */
+.hud.settings {
+  bottom: 18px; right: 18px;
+  width: 178px;
+  display: grid;
+  gap: 9px;
+}
+.hud.settings label { display: grid; gap: 4px; font-size: 11px; opacity: 0.8; }
+.hud.settings label.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.hud.settings select {
+  font: inherit; font-size: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #f0e6da;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 4px 6px;
+}
+.hud.settings .ghost { padding: 6px 10px; font-size: 12px; }
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.14);
+  outline: none;
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--warm);
+  box-shadow: 0 0 10px rgba(255, 150, 60, 0.7);
+  cursor: pointer;
+}
+input[type='range']::-moz-range-thumb {
+  width: 14px; height: 14px; border: none;
+  border-radius: 50%;
+  background: var(--warm);
+  cursor: pointer;
+}
+
+/* marshmallow readout */
+.hud.toast {
+  bottom: 92px; left: 50%;
+  transform: translateX(-50%);
+  width: 260px;
+  display: grid;
+  gap: 6px;
+  text-align: center;
+}
+.hud.toast strong { font-size: 13px; font-weight: 600; }
+.hud.toast em { font-size: 10.5px; opacity: 0.45; font-style: normal; }
+.hud.toast.perfect strong { color: #ffce6a; text-shadow: 0 0 16px rgba(255, 190, 80, 0.6); }
+.hud.toast.burning strong { color: #ff7a3c; animation: pulse 0.55s infinite alternate; }
+.hud.toast.burnt strong { color: #8b8b8b; }
+@keyframes pulse { to { opacity: 0.45; } }
+.toastbar {
+  position: relative;
+  height: 7px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.toastbar i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, #f7f0e2, #d79a4a 48%, #6b3b18 78%, #1a1310);
+  transition: width 0.12s linear;
+}
+.toastbar .perfect {
+  position: absolute; top: 0; bottom: 0;
+  left: 37%; width: 20%;
+  border-left: 1px solid rgba(255, 210, 120, 0.65);
+  border-right: 1px solid rgba(255, 210, 120, 0.65);
+  background: rgba(255, 200, 100, 0.12);
+}
+
+/* first-run hint */
+.hud.hintcard {
+  bottom: 92px; left: 50%;
+  transform: translateX(-50%);
+  width: min(420px, calc(100vw - 36px));
+  display: grid;
+  gap: 8px;
+  text-align: center;
+  cursor: pointer;
+  animation: rise 0.5s ease both;
+}
+.hud.hintcard b { font-size: 14px; }
+.hud.hintcard span { font-size: 12px; opacity: 0.62; line-height: 1.6; }
+.hud.hintcard button { justify-self: center; padding: 6px 16px; font-size: 12px; }
+kbd {
+  font: inherit; font-size: 11px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+@keyframes rise { from { opacity: 0; transform: translate(-50%, 12px); } }
+
+@media (max-width: 720px) {
+  .hud.settings { display: none; }
+  .hud.fuel { width: 130px; top: 14px; right: 14px; }
+  .hud.top { top: 14px; left: 14px; padding: 9px 13px; }
+  .hud.top h1 { font-size: 15px; }
+  .hud.controls { bottom: 12px; gap: 6px; padding: 7px; }
+  .hud button { padding: 8px 10px; font-size: 12px; }
+  .hud.toast, .hud.hintcard { bottom: 116px; }
+}
